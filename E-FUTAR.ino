@@ -15,48 +15,33 @@
  */
 
 #include <ArduinoJson.h>
-#include <SPI.h>
 #include <WiFi.h>
-#include <Wire.h>  // Only needed for Arduino 1.6.5 and earlier
 #include "SSD1306.h" // alias for `#include "SSD1306Wire.h"`
-#include <stdlib.h>
+#include <HTTPClient.h>
 
 bool summerTime = false; //true in summer, false in winter, in the second case it adds an hour to the queried UNIX time
 
 enum busStop {Baross, Janos, Varoskozpont}; // The enum that distinguishes the three preprogrammed stops, we switch between them with the interrupt of the control button, and in the main loop, the HTTP request we send to the server is determined based on this value
 enum busStop currentStop = Baross; // default bus stop
 
-
 bool busStopChangeButtonPressed = false; // debounce
+
+const char* ssid = "YOUR_SSID";
+const char* password = "YOUR_PASSWORD";
+char apiKey[256] = "YOUR_API_KEY";
+
+HTTPClient http;
+
 //OLED pins to ESP32 GPIOs via this connecting:
 //OLED_SDA -- GPIO4
 //OLED_SCL -- GPIO15
 //OLED_RST -- GPIO16
-
 SSD1306  display(0x3c, 4, 15); //Init OLED display
 
-//Modify WiFi credentials to your local WiFi
-
-char ssid[] = "SSID"; //  your network SSID (name)
-char pass[] = "Pass";    // your network password (use for WPA, or use as key for WEP)
-
-
-int keyIndex = 0;            // your network key Index number (needed only for WEP)
-
-int status = WL_IDLE_STATUS; // a status variable indicating the connection to WIFI
-
-// Initialize the Ethernet client library with the IP address and port of the server that you want to connect to (port 80 is default for HTTP):
-WiFiClient client;
-
 // Strings to store the stop name, and the link to the API
-char* stopName = "Baross utca";
-char* resource = "/bkk-utvonaltervezo-api/ws/otp/api/where/arrivals-and-departures-for-stop.json?stopId=BKK_F04144&onlyDepartures=onlyDepartures&limit=10&minutesBefore=0&minutesAfter=60";                    // http resource
-
-//HTTP connection information
-const char* server = "futar.bkk.hu";  // server's address
+char stopName[128];
+char resource[512];                    // http resource
 const unsigned long BAUD_RATE = 115200;                 // serial connection speed
-const unsigned long HTTP_TIMEOUT = 10000;  // max respone time from server
-const size_t MAX_CONTENT_SIZE = 512;       // max size of the HTTP response
 
 //The BusData structure is the basic data storage unit, a structure stores the data of a bus, and 10 such structures form a bus list of 10 (see bus list array)
 struct BusData {
@@ -149,17 +134,19 @@ void setupDisplay() {
 }
 
 void setStop() {
-    if(currentStop==Baross) {
-        stopName = "Baross utca";
-        resource = "/bkk-utvonaltervezo-api/ws/otp/api/where/arrivals-and-departures-for-stop.json?stopId=BKK_F04144&onlyDepartures=onlyDepartures&limit=10&minutesBefore=0&minutesAfter=60";                    // http resource
+    char baseUrl[] = "https://futar.bkk.hu/api/query/v1/ws/otp/api/where/arrivals-and-departures-for-stop.json"; // define the base URL
+
+    if (currentStop == Baross) {
+        strcpy(stopName, "Baross utca");
+        sprintf(resource, "%s?stopId=BKK_F04144&onlyDepartures=onlyDepartures&limit=10&minutesBefore=0&minutesAfter=60&key=%s", baseUrl, apiKey);
     }
-    if(currentStop==Janos) {
-        stopName = "János utca";
-        resource = "/bkk-utvonaltervezo-api/ws/otp/api/where/arrivals-and-departures-for-stop.json?stopId=BKK_F04126&onlyDepartures=onlyDepartures&limit=10&minutesBefore=0&minutesAfter=60";                    // http resource
+    if (currentStop == Janos) {
+        strcpy(stopName, "János utca");
+        sprintf(resource, "%s?stopId=BKK_F04126&onlyDepartures=onlyDepartures&limit=10&minutesBefore=0&minutesAfter=60&key=%s", baseUrl, apiKey);
     }
-    if(currentStop==Varoskozpont) {
-        stopName = "Városközpont";
-        resource = "/bkk-utvonaltervezo-api/ws/otp/api/where/arrivals-and-departures-for-stop.json?stopId=BKK_F04122&onlyDepartures=onlyDepartures&limit=10&minutesBefore=0&minutesAfter=60";                    // http resource
+    if (currentStop == Varoskozpont) {
+        strcpy(stopName, "Városközpont");
+        sprintf(resource, "%s?stopId=BKK_F04122&onlyDepartures=onlyDepartures&limit=10&minutesBefore=0&minutesAfter=60&key=%s", baseUrl, apiKey);
     }
 }
 
@@ -193,62 +180,43 @@ void setup() {
     Serial.print("Connecting to ");
     Serial.println(ssid);
 
-    WiFi.begin(ssid, pass);
-
-    //On the BOOT screen, the dots are animated, just like in a Serial message, until you are connected to Wi-Fi
-    int x = 88;
-    while (WiFi.status() != WL_CONNECTED) {
-        WiFi.begin(ssid, pass);
-        delay(300);
-        Serial.print(".");
-        display.setFont(ArialMT_Plain_16);
-        display.drawString(x, 28, ".");
-        display.display();
-        x=x+4;
-        if(x>126) {
-            x=88;
-            //redraw the display when the dots reach the edge
-            display.clear();
-            display.setTextAlignment(TEXT_ALIGN_LEFT);
-            display.setFont(ArialMT_Plain_24);
-            display.drawString(0, 0, "E-FUTÁR");
-            display.setFont(ArialMT_Plain_16);
-            display.drawString(0, 28, "Csatlakozás"); // "Connecting"
-            display.setFont(ArialMT_Plain_10);
-            display.drawString(0, 52, "Írta: Márkus Balázs"); // "Written by Balazs Markus"
-            display.display();
-        }
-    }
-
-    Serial.println("");
-    Serial.println("WiFi connected");
-    Serial.println("IP address: ");
-    Serial.println(WiFi.localIP());
-
-    Serial.println("Connected to wifi");
-    printWifiStatus();
-
-    Serial.println("\nStarting connection to server...");
-    // if you get a connection, report back via serial:
-    if (client.connect(server, 80)) {
-        Serial.println("Connected to server");
-    }
+    connectToWiFi();
 }
-
 
 // Main loop
 void loop() {
 
     setStop();
     clearBusList();
-    if (connect(server)) {
-        if (sendRequest(server, resource) && skipResponseHeaders()) {
-            if (readReponseContent()) {
+
+    if (WiFi.status() == WL_CONNECTED) {
+    
+
+    Serial.print("[HTTP] begin...\n");
+    if (http.begin(resource)) {
+      Serial.print("[HTTP] GET...\n");
+      int httpCode = http.GET();
+      
+      if (httpCode > 0) {
+        Serial.printf("[HTTP] GET... code: %d\n", httpCode);
+        if (httpCode == HTTP_CODE_OK) {
+          String payload = http.getString();
+          if (readReponseContent(payload.c_str())) {
                 printBusData();
-            }
+          }
         }
+      } else {
+        Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
+      }
+      http.end();
+    } else {
+      Serial.printf("[HTTP} Unable to connect\n");
     }
-    disconnect();
+  } else {
+    Serial.println("WiFi Disconnected");
+    connectToWiFi();
+  }
+    
     // from there the graphic part
     drawList();
 
@@ -285,48 +253,6 @@ void drawList() {
     display.display();
 }
 
-// Open connection to the HTTP server
-bool connect(const char* hostName) {
-    Serial.print("Connect to ");
-    Serial.println(hostName);
-
-    bool ok = client.connect(hostName, 80);
-
-    Serial.println(ok ? "Connected" : "Connection Failed!");
-    return ok;
-}
-
-// Send the HTTP GET request to the server
-bool sendRequest(const char* host, const char* resource) {
-    Serial.print("GET ");
-    Serial.println(resource);
-
-    client.print("GET ");
-    client.print(resource);
-    client.println(" HTTP/1.0");
-    client.print("Host: ");
-    client.println(host);
-    client.println("Connection: close");
-    client.println();
-
-    return true;
-}
-
-// Skip HTTP headers so that we are at the beginning of the response's body
-bool skipResponseHeaders() {
-    // HTTP headers end with an empty line
-    char endOfHeaders[] = "\r\n\r\n";
-
-    client.setTimeout(HTTP_TIMEOUT);
-    bool ok = client.find(endOfHeaders);
-
-    if (!ok) {
-        Serial.println("No response or invalid response!");
-    }
-
-    return ok;
-}
-
 uint16_t maxArraySize=0, ArraySize=0;
 
 void clearBusList() {
@@ -342,24 +268,22 @@ void clearBusList() {
     }
 }
 
-bool readReponseContent() {
+bool readReponseContent(const char* jsonString) {
+    const size_t BUFFER_SIZE = JSON_OBJECT_SIZE(1) + JSON_OBJECT_SIZE(2) + JSON_OBJECT_SIZE(3) + 3*JSON_OBJECT_SIZE(4) + 2*JSON_OBJECT_SIZE(5) + JSON_OBJECT_SIZE(7) + JSON_OBJECT_SIZE(8) + JSON_OBJECT_SIZE(9) + JSON_OBJECT_SIZE(10) + JSON_OBJECT_SIZE(12) + 2*JSON_OBJECT_SIZE(13) + JSON_OBJECT_SIZE(14) + JSON_OBJECT_SIZE(16) + JSON_OBJECT_SIZE(17) + 670;
 
-    // Compute optimal size of the JSON buffer according to what we need to parse.
-    // See https://bblanchon.github.io/ArduinoJson/assistant/
-    const size_t BUFFER_SIZE =2*JSON_ARRAY_SIZE(0) + JSON_ARRAY_SIZE(8) + JSON_ARRAY_SIZE(10) + JSON_OBJECT_SIZE(0) + 2*JSON_OBJECT_SIZE(1) + 2*JSON_OBJECT_SIZE(4) + 4*JSON_OBJECT_SIZE(5) + 2*JSON_OBJECT_SIZE(6) + 7*JSON_OBJECT_SIZE(7) + JSON_OBJECT_SIZE(8) + 11*JSON_OBJECT_SIZE(10) + 9*JSON_OBJECT_SIZE(12);
+    DynamicJsonDocument jsonDocument(BUFFER_SIZE);
 
-    // Allocate a temporary memory pool
-    DynamicJsonBuffer jsonBuffer(BUFFER_SIZE);
+    DeserializationError error = deserializeJson(jsonDocument, jsonString);
 
-    JsonObject& root = jsonBuffer.parseObject(client);
-
-    if (!root.success()) {
-        Serial.println("JSON parsing failed!");
+    if (error) {
+        Serial.print("deserializeJson() failed: ");
+        Serial.println(error.f_str());
         return false;
     }
 
-    // at night, the "stoptimes" doesn't always contain 10 buses, so I have to cast it into arrays and then scan the size
-    JsonArray& nestedArray = root["data"]["entry"]["stopTimes"].asArray();
+    JsonObject root = jsonDocument.as<JsonObject>();
+// at night, the "stoptimes" doesn't always contain 10 buses, so I have to cast it into arrays and then scan the size
+    JsonArray nestedArray = root["data"]["entry"]["stopTimes"].as<JsonArray>();
 
     // at night, the "stoptimes" doesn't always contain 10 buses, only those that depart within half an hour, so we need to look at the size of the array, because if we refer to something that isn't there, it throws a Guru CPU Error
     Serial.print("Size of stopTimes: ");
@@ -374,13 +298,14 @@ bool readReponseContent() {
         maxArraySize=3;
     }
 
-    strncpy(currentTime, root["currentTime"],10);
+    String currentTimeString = root["currentTime"];
+    strncpy(currentTime,currentTimeString.c_str(),10);
     currentTimeLong = atol(currentTime);
 
     ConvertTime();
 
     for(int i=0; i<maxArraySize; i++) {
-        JsonObject& actualBus = root["data"]["entry"]["stopTimes"][i];
+        JsonObject actualBus = root["data"]["entry"]["stopTimes"][i];
 
         if (actualBus.containsKey("predictedArrivalTime"))
         {
@@ -388,7 +313,8 @@ bool readReponseContent() {
             // they are in milliseconds, which can only be stored in long long, but we can't do that so we cut off the first 10 numbers (with names the first 25 characters), to fit the display for sure so we get a resolution of one seconds, so that we can store the times in plain long
             strncpy(busList[i].stopHeadsign, root["data"]["entry"]["stopTimes"][i]["stopHeadsign"],20
                    );
-            strncpy(busList[i].predictedArrivalTime, root["data"]["entry"]["stopTimes"][i]["predictedArrivalTime"],10);
+            String predictedArrivalTimeString = root["data"]["entry"]["stopTimes"][i]["predictedArrivalTime"];
+            strncpy(busList[i].predictedArrivalTime, predictedArrivalTimeString.c_str(),10);
             busList[i].predictedArrivalTimeLong = atol(busList[i].predictedArrivalTime);
             busList[i].predictedArrivalMinutesInt = SecondsToMinutes(busList[i].predictedArrivalTimeLong-currentTimeLong);  // subtract the current time and then convert it from second to minute
             ArrivalMinutesToString(busList[i].predictedArrivalMinutesInt,busList[i].predictedArrivalMinutesString);
@@ -419,7 +345,8 @@ bool readReponseContent() {
             // predticted time is NOT valid
             Serial.println("Arrival");
             strncpy(busList[i].stopHeadsign, root["data"]["entry"]["stopTimes"][i]["stopHeadsign"],20);
-            strncpy(busList[i].predictedArrivalTime, root["data"]["entry"]["stopTimes"][i]["arrivalTime"],10);
+            String arrivalTimeString = root["data"]["entry"]["stopTimes"][i]["arrivalTime"];
+            strncpy(busList[i].predictedArrivalTime, arrivalTimeString.c_str(),10);
             busList[i].predictedArrivalTimeLong = atol(busList[i].predictedArrivalTime); // cast from string to long
             busList[i].predictedArrivalMinutesInt = SecondsToMinutes(busList[i].predictedArrivalTimeLong-currentTimeLong);  // subtract the current time and then convert it from second to minute
             ArrivalMinutesToString(busList[i].predictedArrivalMinutesInt,busList[i].predictedArrivalMinutesString);
@@ -474,10 +401,43 @@ void printBusData() {
     }
 }
 
-// Close the connection with the HTTP server
-void disconnect() {
-    Serial.println("Disconnect");
-    client.stop();
+
+void connectToWiFi() {
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+  
+  
+  int attempts = 0;
+  //On the BOOT screen, the dots are animated, just like in a Serial message, until you are connected to Wi-Fi
+  int x = 88;
+  while (WiFi.status() != WL_CONNECTED && attempts < 10) {
+    delay(300);
+    Serial.println("Attempting to connect to WiFi...");
+    attempts++;
+
+    display.setFont(ArialMT_Plain_16);
+    display.drawString(x, 28, ".");
+    display.display();
+    x=x+4;
+    if(x>126) {
+        x=88;
+        //redraw the display when the dots reach the edge
+        display.clear();
+        display.setTextAlignment(TEXT_ALIGN_LEFT);
+        display.setFont(ArialMT_Plain_24);
+        display.drawString(0, 0, "E-FUTÁR");
+        display.setFont(ArialMT_Plain_16);
+        display.drawString(0, 28, "Csatlakozás"); // "Connecting"
+        display.setFont(ArialMT_Plain_10);
+        display.drawString(0, 52, "Írta: Márkus Balázs"); // "Written by Balazs Markus"
+        display.display();
+    }
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Connected to WiFi successfully");
+  } else {
+    Serial.println("Failed to connect to WiFi");
+  }
 }
 
 // Wait a little, so that we don't do queries too often
