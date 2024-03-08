@@ -7,41 +7,56 @@
  * With the help of the program, the microcontroller displays the next buses departing from a given bus stop and the remaining time until departure, as well as the current time on an OLED display.
  * The program can handle several stops, you can switch between them with the built-in button of the development card, the loading status is indicated by the built-in white SMD LED.
  * 
- * WiFi configuration required before uploading!
+ * WiFi and API key configuration required before uploading!
  * If you want to add other stops, the list of JSON files to be parsed must be modified!
  * 
  * See the ReadMe file for more information
  * 
  */
 
+//*****************************************************************************
+// @includes
+//*****************************************************************************
+
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include "SSD1306.h" // alias for `#include "SSD1306Wire.h"`
 #include <HTTPClient.h>
 
+//*****************************************************************************
+// @defines
+//*****************************************************************************
+
+#define BAUD_RATE 115200 // serial connection speed
+
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+
+#define LED_OUTPUT_PIN 25
+
+//*****************************************************************************
+// @globals
+//*****************************************************************************
+
+const char apiKey[256] = "YOUR_API_KEY";
+
+const char baseUrl[] = "https://futar.bkk.hu/api/query/v1/ws/otp/api/where/arrivals-and-departures-for-stop.json"; // define the base URL
+
 bool summerTime = false; //true in summer, false in winter, in the second case it adds an hour to the queried UNIX time
 
-enum busStop {Baross, Janos, Varoskozpont}; // The enum that distinguishes the three preprogrammed stops, we switch between them with the interrupt of the control button, and in the main loop, the HTTP request we send to the server is determined based on this value
-enum busStop currentStop = Baross; // default bus stop
+struct busStop {
+    const char* stopID;
+    const char* stopName;
+};
 
-bool busStopChangeButtonPressed = false; // debounce
+// Bus stop database
+const busStop busStopList[] = {
+    {"BKK_F04144", "Baross utca"},
+    {"BKK_F04126", "János utca"},
+    {"BKK_F04122", "Városközpont"}
+};
 
-const char* ssid = "YOUR_SSID";
-const char* password = "YOUR_PASSWORD";
-char apiKey[256] = "YOUR_API_KEY";
-
-HTTPClient http;
-
-//OLED pins to ESP32 GPIOs via this connecting:
-//OLED_SDA -- GPIO4
-//OLED_SCL -- GPIO15
-//OLED_RST -- GPIO16
-SSD1306  display(0x3c, 4, 15); //Init OLED display
-
-// Strings to store the stop name, and the link to the API
-char stopName[128];
-char resource[512];                    // http resource
-const unsigned long BAUD_RATE = 115200;                 // serial connection speed
+int currentBusStopIndex = 0; // default bus stop
 
 //The BusData structure is the basic data storage unit, a structure stores the data of a bus, and 10 such structures form a bus list of 10 (see bus list array)
 struct BusData {
@@ -54,8 +69,124 @@ struct BusData {
     char predictedArrivalMinutesString[3]; //Arrival time in minutes as a string, with an apostrophe concatenated at the end
 };
 
-//Converts the the arrival time that we got in long type, and a resolution of seconds to int type, with a resolution of one minute, to be able to copy it to predictedArrivalMinutesInt
-int SecondsToMinutes(long secondsLong) {
+struct BusData busList[10]; // List of arriving buses
+
+char currentTime[32];
+long currentTimeLong,currentTimeHours,currentTimeMinutes;
+char clockTimeString[5];
+uint16_t maxArraySize=0, ArraySize=0;
+
+// HTTP CLIENT
+HTTPClient http;
+char resource[512];                    // http resource (the complete URL)
+
+// OLED DISPLAY
+//OLED pins to ESP32 GPIOs via this connecting:
+//OLED_SDA -- GPIO4
+//OLED_SCL -- GPIO15
+//OLED_RST -- GPIO16
+SSD1306  display(0x3c, 4, 15); //Init OLED display
+
+
+//*****************************************************************************
+// @functions
+//*****************************************************************************
+
+/**
+ * @brief Sets up initial configurations, pins, and interrupts.
+ * 
+ * This function initializes the necessary configurations for the program to run properly,
+ * including setting up pins, serial communication, and interrupts for button presses.
+ */
+void setup() {
+    Serial.begin(115200);
+
+    // Bus stop change interrupt button
+    pinMode(0, INPUT_PULLUP);
+    pinMode(LED_OUTPUT_PIN, OUTPUT); // The busy LED indicator on the development board
+    
+    setupDisplay(); // Setup SSD1306 OLED
+
+    connectToWiFiSplashScreen();
+    attachInterrupt(digitalPinToInterrupt(0), changeCurrentStop, FALLING);
+}
+
+/**
+ * @brief The main loop function.
+ * 
+ * This function is the main loop of the program, where it continuously executes the necessary tasks
+ * such as fetching bus data, updating the display, and handling interruptions.
+ */
+void loop() {
+    clearBusList();
+    sprintf(resource, "%s?stopId=%s&onlyDepartures=onlyDepartures&limit=10&minutesBefore=0&minutesAfter=60&key=%s", baseUrl, busStopList[currentBusStopIndex].stopID, apiKey);
+    httpGetBusData(resource);
+    drawBusListToDisplay();
+    delay(2000);     // a little delay so that it doesn't do quieries too often
+}
+
+// -------- INTERRUPT CALLBACKS --------
+
+/**
+ * @brief Interrupt callback function, changes the HTTP resource for the next bus stop.
+ * 
+ * This function is called when the interrupt button is pressed, and it changes the HTTP resource
+ * to fetch bus data for the next bus stop in the list.
+ */
+void changeCurrentStop() {
+    digitalWrite(LED_OUTPUT_PIN, HIGH);
+    int numStops = sizeof(busStopList) / sizeof(busStopList[0]);
+    if(currentBusStopIndex < (numStops - 1)) currentBusStopIndex += 1;
+    else currentBusStopIndex = 0;
+}
+
+// -------- NETWORK FUNCTIONS --------
+
+/**
+ * @brief Fetches bus data from the API using HTTP GET request.
+ * 
+ * @param inputResource The HTTP resource to fetch bus data.
+ * 
+ * This function sends an HTTP GET request to the provided resource to fetch bus data
+ * for the current bus stop, then calls the JSON parsing function.
+ */
+void httpGetBusData(char* inputResource){
+    if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[HTTP] begin...\n");
+    if (http.begin(inputResource)) {
+      Serial.print("[HTTP] GET...\n");
+      int httpCode = http.GET();
+      
+      if (httpCode > 0) {
+        Serial.printf("[HTTP] GET... code: %d\n", httpCode);
+        if (httpCode == HTTP_CODE_OK) {
+          String payload = http.getString();
+          parseReponseContent(payload.c_str());
+        }
+      } else {
+        Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
+      }
+      http.end();
+    } else {
+      Serial.printf("[HTTP} Unable to connect\n");
+    }
+  } else {
+    Serial.println("WiFi Disconnected");
+    connectToWiFiSplashScreen();
+  }
+}
+
+// -------- DATA MANIPULATION AND PARSING FUNCTIONS --------
+
+/**
+ * @brief Converts seconds to minutes.
+ * 
+ * @param secondsLong The time in seconds.
+ * @return int The time converted to minutes.
+ * 
+ * This function converts the provided time in seconds to minutes and returns the result, for us to be able to copy it to predictedArrivalMinutesInt.
+ */
+int secondsToMinutes(long secondsLong) {
     long minutesLong;
     int minutesInt;
     minutesLong = secondsLong/60;
@@ -63,8 +194,16 @@ int SecondsToMinutes(long secondsLong) {
     return minutesInt;
 }
 
-//To print the arrival time, the time we first converted to int must be converted to char, and the apostrophe must be placed at the end, this is what the function does
-void ArrivalMinutesToString(int arrivalMinutes, char* arrivalString) {
+/**
+ * @brief Converts arrival minutes to a string representation.
+ * 
+ * @param arrivalMinutes The arrival time in minutes.
+ * @param arrivalString Pointer to a character array to store the resulting string.
+ * 
+ * This function converts the provided arrival time in minutes to a string representation
+ * with an apostrophe concatenated at the end and stores it in the specified character array.
+ */
+void arrivalMinutesToString(int arrivalMinutes, char* arrivalString) {
     if(arrivalMinutes < 1) {
         for(int k=0; k<3; k++) arrivalString[k] = ' '; // it must be cleared, so that if anything is left out of the previous cycle, it will be deleted
         arrivalString[0]= '-';
@@ -85,13 +224,14 @@ void ArrivalMinutesToString(int arrivalMinutes, char* arrivalString) {
     }
 }
 
-struct BusData busList[10];
-char currentTime[32];
-long currentTimeLong,currentTimeHours,currentTimeMinutes;
-
-char clockTimeString[5];
-
-void ConvertTime() {
+/**
+ * @brief Converts Unix epoch time (1709905849875) to human-readable hours and minutes.
+ * 
+ * This function converts the Unix epoch time (in milliseconds) retrieved from the API
+ * into human-readable hours and minutes in 24-hour format (14:50) and saves it into clockTimeString[5]
+ * for displaying it on the OLED display.
+ */
+void convertUnixTimeToHoursMinutesString() {
     if(summerTime==true) {
         currentTimeHours = (currentTimeLong % 86400) / 3600;
         currentTimeMinutes = (currentTimeLong % 3600) / 60;
@@ -115,146 +255,13 @@ void ConvertTime() {
         clockTimeString[3] = (currentTimeMinutes/10) + '0';
         clockTimeString[4] = (currentTimeMinutes%10) + '0';
     }
-    Serial.print("The current time: ");
-    Serial.print(currentTimeHours);
-    Serial.print(":");
-    Serial.println(currentTimeMinutes);
 }
 
-void setupDisplay() {
-    pinMode(16,OUTPUT);
-    digitalWrite(16, LOW);    // set GPIO16 low to reset OLED
-    delay(50);
-    digitalWrite(16, HIGH); // while OLED is running, must set GPIO16 in high
-    // Initializing the UI will init the display too.
-    display.init();
-
-    display.flipScreenVertically();
-    display.setFont(ArialMT_Plain_10);
-}
-
-void setStop() {
-    char baseUrl[] = "https://futar.bkk.hu/api/query/v1/ws/otp/api/where/arrivals-and-departures-for-stop.json"; // define the base URL
-
-    if (currentStop == Baross) {
-        strcpy(stopName, "Baross utca");
-        sprintf(resource, "%s?stopId=BKK_F04144&onlyDepartures=onlyDepartures&limit=10&minutesBefore=0&minutesAfter=60&key=%s", baseUrl, apiKey);
-    }
-    if (currentStop == Janos) {
-        strcpy(stopName, "János utca");
-        sprintf(resource, "%s?stopId=BKK_F04126&onlyDepartures=onlyDepartures&limit=10&minutesBefore=0&minutesAfter=60&key=%s", baseUrl, apiKey);
-    }
-    if (currentStop == Varoskozpont) {
-        strcpy(stopName, "Városközpont");
-        sprintf(resource, "%s?stopId=BKK_F04122&onlyDepartures=onlyDepartures&limit=10&minutesBefore=0&minutesAfter=60&key=%s", baseUrl, apiKey);
-    }
-}
-
-void changeCurrentStop() {
-    digitalWrite(25, HIGH);
-    if(currentStop==Baross) currentStop = Janos;
-    else if(currentStop==Janos) currentStop = Varoskozpont;
-    else if(currentStop==Varoskozpont) currentStop = Baross;
-}
-
-
-// ARDUINO entry point #1: runs once when you press reset or power the board
-void setup() {
-    Serial.begin(115200);
-    pinMode(0, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(0), changeCurrentStop, FALLING);
-    pinMode(25, OUTPUT); //the busy LED on the motherboard
-    digitalWrite(25, LOW);
-    setupDisplay();
-    display.clear();
-    display.setTextAlignment(TEXT_ALIGN_LEFT);
-    display.setFont(ArialMT_Plain_24);
-    display.drawString(0, 0, "E-FUTÁR");
-    display.setFont(ArialMT_Plain_16);
-    display.drawString(0, 28, "Csatlakozás"); // "Connecting"
-    display.setFont(ArialMT_Plain_10);
-    display.drawString(0, 52, "Írta: Márkus Balázs"); // "Written by Balazs Markus"
-    display.display();
-    // attempt to connect to Wifi network:
-
-    Serial.print("Connecting to ");
-    Serial.println(ssid);
-
-    connectToWiFi();
-}
-
-// Main loop
-void loop() {
-
-    setStop();
-    clearBusList();
-
-    if (WiFi.status() == WL_CONNECTED) {
-    
-
-    Serial.print("[HTTP] begin...\n");
-    if (http.begin(resource)) {
-      Serial.print("[HTTP] GET...\n");
-      int httpCode = http.GET();
-      
-      if (httpCode > 0) {
-        Serial.printf("[HTTP] GET... code: %d\n", httpCode);
-        if (httpCode == HTTP_CODE_OK) {
-          String payload = http.getString();
-          if (readReponseContent(payload.c_str())) {
-                printBusData();
-          }
-        }
-      } else {
-        Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
-      }
-      http.end();
-    } else {
-      Serial.printf("[HTTP} Unable to connect\n");
-    }
-  } else {
-    Serial.println("WiFi Disconnected");
-    connectToWiFi();
-  }
-    
-    // from there the graphic part
-    drawList();
-
-    // a little delay so that it doesn't do quieries too often
-    wait();
-}
-
-void drawList() {
-    // Pringting the list to the screen
-    // Additional fonts are available at http://oleddisplay.squix.ch/
-   
-    display.clear();
-
-    display.setTextAlignment(TEXT_ALIGN_LEFT);
-    display.setFont(ArialMT_Plain_16);
-    display.drawString(0, 0, stopName);
-    display.setTextAlignment(TEXT_ALIGN_RIGHT);
-    display.setFont(ArialMT_Plain_10);
-    display.drawString(128, 0, clockTimeString);
-    display.setTextAlignment(TEXT_ALIGN_LEFT);
-    if(busList[0].stopHeadsign[0]=='\0') {
-        display.drawString(0, 20, "Nem található indulás"); // "No departure found"
-        display.drawString(0, 34, "60 percen belül."); // "in 60 minutes"
-    }
-    else {
-        display.drawString(0, 20, busList[0].stopHeadsignWithShortName);
-        display.drawString(0, 34, busList[1].stopHeadsignWithShortName);
-        display.drawString(0, 48, busList[2].stopHeadsignWithShortName);
-        display.setTextAlignment(TEXT_ALIGN_RIGHT);
-        display.drawString(128, 20, busList[0].predictedArrivalMinutesString); //At 116 the apostrophe is sticking out so you have to put the minute numbers at 115! Tested with 88 '
-        display.drawString(128, 34, busList[1].predictedArrivalMinutesString);
-        display.drawString(128, 48, busList[2].predictedArrivalMinutesString);
-    }
-    display.display();
-}
-
-uint16_t maxArraySize=0, ArraySize=0;
-
+/**
+ * @brief Clears the bus list array.
+ * 
+ * This function clears the bus list array to prepare it for storing new bus data.
+ */
 void clearBusList() {
     //First we reset the bus list and then copy the appropriate number of departing buses that we defined in MaxArraySize, the rest remain zero
     for(int t=0; t<10; t++) {
@@ -268,7 +275,16 @@ void clearBusList() {
     }
 }
 
-bool readReponseContent(const char* jsonString) {
+/**
+ * @brief Parses the response content received from the API.
+ * 
+ * @param jsonString The JSON string response from the API.
+ * @return bool Returns true if parsing is successful, false otherwise.
+ * 
+ * This function parses the JSON response received from the API and populates
+ * the bus list in the busList array with the retrieved bus data.
+ */
+bool parseReponseContent(const char* jsonString) {
     const size_t BUFFER_SIZE = JSON_OBJECT_SIZE(1) + JSON_OBJECT_SIZE(2) + JSON_OBJECT_SIZE(3) + 3*JSON_OBJECT_SIZE(4) + 2*JSON_OBJECT_SIZE(5) + JSON_OBJECT_SIZE(7) + JSON_OBJECT_SIZE(8) + JSON_OBJECT_SIZE(9) + JSON_OBJECT_SIZE(10) + JSON_OBJECT_SIZE(12) + 2*JSON_OBJECT_SIZE(13) + JSON_OBJECT_SIZE(14) + JSON_OBJECT_SIZE(16) + JSON_OBJECT_SIZE(17) + 670;
 
     DynamicJsonDocument jsonDocument(BUFFER_SIZE);
@@ -282,7 +298,7 @@ bool readReponseContent(const char* jsonString) {
     }
 
     JsonObject root = jsonDocument.as<JsonObject>();
-// at night, the "stoptimes" doesn't always contain 10 buses, so I have to cast it into arrays and then scan the size
+    // at night, the "stoptimes" doesn't always contain 10 buses, so I have to cast it into arrays and then scan the size
     JsonArray nestedArray = root["data"]["entry"]["stopTimes"].as<JsonArray>();
 
     // at night, the "stoptimes" doesn't always contain 10 buses, only those that depart within half an hour, so we need to look at the size of the array, because if we refer to something that isn't there, it throws a Guru CPU Error
@@ -301,8 +317,7 @@ bool readReponseContent(const char* jsonString) {
     String currentTimeString = root["currentTime"];
     strncpy(currentTime,currentTimeString.c_str(),10);
     currentTimeLong = atol(currentTime);
-
-    ConvertTime();
+    convertUnixTimeToHoursMinutesString();
 
     for(int i=0; i<maxArraySize; i++) {
         JsonObject actualBus = root["data"]["entry"]["stopTimes"][i];
@@ -316,8 +331,8 @@ bool readReponseContent(const char* jsonString) {
             String predictedArrivalTimeString = root["data"]["entry"]["stopTimes"][i]["predictedArrivalTime"];
             strncpy(busList[i].predictedArrivalTime, predictedArrivalTimeString.c_str(),10);
             busList[i].predictedArrivalTimeLong = atol(busList[i].predictedArrivalTime);
-            busList[i].predictedArrivalMinutesInt = SecondsToMinutes(busList[i].predictedArrivalTimeLong-currentTimeLong);  // subtract the current time and then convert it from second to minute
-            ArrivalMinutesToString(busList[i].predictedArrivalMinutesInt,busList[i].predictedArrivalMinutesString);
+            busList[i].predictedArrivalMinutesInt = secondsToMinutes(busList[i].predictedArrivalTimeLong-currentTimeLong);  // subtract the current time and then convert it from second to minute
+            arrivalMinutesToString(busList[i].predictedArrivalMinutesInt,busList[i].predictedArrivalMinutesString);
 
             char tripId[32];
             char routeId[32];
@@ -339,7 +354,7 @@ bool readReponseContent(const char* jsonString) {
             Serial.println(shortName);
 
             // the LED will only turn off if we have been able to overwrite it successfully
-            digitalWrite(25, LOW);
+            digitalWrite(LED_OUTPUT_PIN, LOW);
         }
         else if(actualBus.containsKey("arrivalTime")) {
             // predticted time is NOT valid
@@ -348,8 +363,8 @@ bool readReponseContent(const char* jsonString) {
             String arrivalTimeString = root["data"]["entry"]["stopTimes"][i]["arrivalTime"];
             strncpy(busList[i].predictedArrivalTime, arrivalTimeString.c_str(),10);
             busList[i].predictedArrivalTimeLong = atol(busList[i].predictedArrivalTime); // cast from string to long
-            busList[i].predictedArrivalMinutesInt = SecondsToMinutes(busList[i].predictedArrivalTimeLong-currentTimeLong);  // subtract the current time and then convert it from second to minute
-            ArrivalMinutesToString(busList[i].predictedArrivalMinutesInt,busList[i].predictedArrivalMinutesString);
+            busList[i].predictedArrivalMinutesInt = secondsToMinutes(busList[i].predictedArrivalTimeLong-currentTimeLong);  // subtract the current time and then convert it from second to minute
+            arrivalMinutesToString(busList[i].predictedArrivalMinutesInt,busList[i].predictedArrivalMinutesString);
 
             char tripId[32];
             char routeId[32];
@@ -371,7 +386,7 @@ bool readReponseContent(const char* jsonString) {
             Serial.println(shortName);
 
             // the LED will only turn off if we have been able to overwrite it successfully
-            digitalWrite(25, LOW);
+            digitalWrite(LED_OUTPUT_PIN, LOW);
         }
         else {
             Serial.println("noInfo");
@@ -379,42 +394,57 @@ bool readReponseContent(const char* jsonString) {
     }
     if(maxArraySize==0) {
         // if no start is found in the next 60 minutes then the LED will not go off so let's just turn it off
-        digitalWrite(25, LOW);
+        digitalWrite(LED_OUTPUT_PIN, LOW);
     }
     return true;
 }
 
 
-// Print the data extracted from the JSON
-void printBusData() {
-    for(uint16_t i=0; i<maxArraySize; i++) {
-        Serial.print("shortName = ");
-        Serial.println(busList[i].shortName);
-        Serial.print("stopHeadsign = ");
-        Serial.println(busList[i].stopHeadsign);
-        Serial.print("predictedArrivalTime = ");
-        Serial.println(busList[i].predictedArrivalTime);
-        Serial.print("predictedArrivalTimeLong = ");
-        Serial.println(busList[i].predictedArrivalTimeLong);
-        Serial.print("predictedArrivalMinutesInt = ");
-        Serial.println(busList[i].predictedArrivalMinutesInt);
-    }
+// -------- DISPLAY AND WIFI FUNCTIONS --------
+
+/**
+ * @brief Initializes the OLED display.
+ * 
+ * This function initializes the OLED display with the appropriate settings.
+ */
+void setupDisplay() {
+    pinMode(16,OUTPUT);
+    digitalWrite(16, LOW);    // set GPIO16 low to reset OLED
+    delay(50);
+    digitalWrite(16, HIGH); // while OLED is running, must set GPIO16 in high
+    // Initializing the UI will init the display too.
+    display.init();
+    display.flipScreenVertically();
+    display.setFont(ArialMT_Plain_10);
 }
 
+/**
+ * @brief Connects to WiFi and displays a splash screen while connecting.
+ * 
+ * This function connects to the configured WiFi network and displays a splash screen
+ * on the OLED display while attempting to connect.
+ */
+void connectToWiFiSplashScreen() {
+  digitalWrite(LED_OUTPUT_PIN, LOW);
+  Serial.print("Connecting to ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-void connectToWiFi() {
-  Serial.println("Connecting to WiFi...");
-  WiFi.begin(ssid, password);
-  
-  
-  int attempts = 0;
+  display.clear();
+  display.setTextAlignment(TEXT_ALIGN_LEFT);
+  display.setFont(ArialMT_Plain_24);
+  display.drawString(0, 0, "E-FUTÁR");
+  display.setFont(ArialMT_Plain_16);
+  display.drawString(0, 28, "Csatlakozás"); // "Connecting"
+  display.setFont(ArialMT_Plain_10);
+  display.drawString(0, 52, "Írta: Márkus Balázs"); // "Written by Balazs Markus"
+  display.display();
+
   //On the BOOT screen, the dots are animated, just like in a Serial message, until you are connected to Wi-Fi
   int x = 88;
-  while (WiFi.status() != WL_CONNECTED && attempts < 10) {
+  while (WiFi.status() != WL_CONNECTED) {
     delay(300);
     Serial.println("Attempting to connect to WiFi...");
-    attempts++;
-
     display.setFont(ArialMT_Plain_16);
     display.drawString(x, 28, ".");
     display.display();
@@ -440,25 +470,35 @@ void connectToWiFi() {
   }
 }
 
-// Wait a little, so that we don't do queries too often
-void wait() {
-    Serial.println("Wait 2 seconds");
-    delay(2000);
-}
+/**
+ * @brief Draws the contents of the bus list array to the display.
+ * 
+ * This function draws the bus data for the first three buses from the bus list array onto the OLED display.
+ */
+void drawBusListToDisplay() {
+    // Printing the list to the screen
+    // Additional fonts are available at http://oleddisplay.squix.ch/
+    display.clear();
 
-void printWifiStatus() {
-    // print the SSID of the network you're attached to:
-    Serial.print("SSID: ");
-    Serial.println(WiFi.SSID());
-
-    // print your WiFi device's IP address:
-    IPAddress ip = WiFi.localIP();
-    Serial.print("IP Address: ");
-    Serial.println(ip);
-
-    // print the received signal strength:
-    long rssi = WiFi.RSSI();
-    Serial.print("signal strength (RSSI):");
-    Serial.print(rssi);
-    Serial.println(" dBm");
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    display.setFont(ArialMT_Plain_16);
+    display.drawString(0, 0, busStopList[currentBusStopIndex].stopName);
+    display.setTextAlignment(TEXT_ALIGN_RIGHT);
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(128, 0, clockTimeString);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    if(busList[0].stopHeadsign[0]=='\0') {
+        display.drawString(0, 20, "Nem található indulás"); // "No departure found"
+        display.drawString(0, 34, "60 percen belül."); // "in 60 minutes"
+    }
+    else {
+        display.drawString(0, 20, busList[0].stopHeadsignWithShortName);
+        display.drawString(0, 34, busList[1].stopHeadsignWithShortName);
+        display.drawString(0, 48, busList[2].stopHeadsignWithShortName);
+        display.setTextAlignment(TEXT_ALIGN_RIGHT);
+        display.drawString(128, 20, busList[0].predictedArrivalMinutesString); //At 116 the apostrophe is sticking out so you have to put the minute numbers at 115! Tested with 88 '
+        display.drawString(128, 34, busList[1].predictedArrivalMinutesString);
+        display.drawString(128, 48, busList[2].predictedArrivalMinutesString);
+    }
+    display.display();
 }
